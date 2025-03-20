@@ -3,8 +3,11 @@
 import logging
 import os
 import sys
-import re
 import json
+import aiohttp
+from datetime import datetime
+from bs4 import BeautifulSoup
+import hashlib
 
 # 添加项目根目录到sys.path
 sys.path.append(
@@ -23,21 +26,59 @@ DATA_DIR = os.path.join(
     "QFNUNoticeMonitor",
 )
 
+# 历史记录文件路径
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+
+# 监控URL
+MONITOR_URLS = {
+    "通知": "https://jwc.qfnu.edu.cn/tz_j_.htm#/",
+    "公告": "https://jwc.qfnu.edu.cn/gg_j_.htm#/",
+}
+
+# 上次执行时间
+last_execution_time = None
+
+# 在文件开头的常量定义部分添加
+ENABLED_GROUPS_FILE = os.path.join(DATA_DIR, "enabled_groups.json")
+
 
 # 查看功能开关状态
 def load_function_status(group_id):
-    return load_switch(group_id, "QFNUNoticeMonitor")
+    """加载群组功能状态"""
+    # 检查总开关状态
+    if not load_switch(group_id, "QFNUNoticeMonitor"):
+        return False
+
+    # 检查本地存储的状态
+    if os.path.exists(ENABLED_GROUPS_FILE):
+        with open(ENABLED_GROUPS_FILE, "r", encoding="utf-8") as f:
+            enabled_groups = json.load(f)
+            return str(group_id) in enabled_groups
+    return False
 
 
 # 保存功能开关状态
 def save_function_status(group_id, status):
+    """保存群组功能状态"""
+    # 保存总开关状态
     save_switch(group_id, "QFNUNoticeMonitor", status)
 
-
-# 处理元事件，用于启动时确保数据目录存在
-async def handle_meta_event(websocket, msg):
-    """处理元事件"""
+    # 保存本地状态
     os.makedirs(DATA_DIR, exist_ok=True)
+    enabled_groups = []
+
+    if os.path.exists(ENABLED_GROUPS_FILE):
+        with open(ENABLED_GROUPS_FILE, "r", encoding="utf-8") as f:
+            enabled_groups = json.load(f)
+
+    group_id = str(group_id)
+    if status and group_id not in enabled_groups:
+        enabled_groups.append(group_id)
+    elif not status and group_id in enabled_groups:
+        enabled_groups.remove(group_id)
+
+    with open(ENABLED_GROUPS_FILE, "w", encoding="utf-8") as f:
+        json.dump(enabled_groups, f, ensure_ascii=False, indent=2)
 
 
 # 处理开关状态
@@ -79,7 +120,7 @@ async def handle_group_message(websocket, msg):
         authorized = user_id in owner_id
 
         # 处理开关命令
-        if raw_message == "QFNUNoticeMonitor":
+        if raw_message == "qfnunm":
             await toggle_function_status(websocket, group_id, message_id, authorized)
             return
         # 检查功能是否开启
@@ -165,6 +206,137 @@ async def handle_request_event(websocket, msg):
         return
 
 
+def is_five_minutes():
+    """检查当前分钟是否是5的倍数"""
+    current_minute = datetime.now().minute
+    return current_minute % 5 == 0
+
+
+def load_history():
+    """加载历史记录"""
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"通知": [], "公告": []}
+
+
+def save_history(history):
+    """保存历史记录"""
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+async def fetch_page(url):
+    """获取网页内容"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.text()
+
+
+def get_all_groups():
+    """获取所有已启用功能的群组ID列表"""
+    if os.path.exists(ENABLED_GROUPS_FILE):
+        with open(ENABLED_GROUPS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def parse_notices(html, notice_type):
+    """解析网页内容，提取通知/公告信息"""
+    soup = BeautifulSoup(html, "html.parser")
+    notices = []
+
+    # 根据网页结构解析内容
+    for item in soup.select("ul.n_listxx1 li"):
+        # 获取标题和链接
+        title_elem = item.select_one("h2 a")
+        if not title_elem:
+            continue
+
+        title = title_elem.get_text(strip=True)
+        link = title_elem.get("href", "")
+
+        # 获取摘要
+        summary_elem = item.select_one("p")
+        summary = summary_elem.get_text(strip=True) if summary_elem else ""
+
+        # 处理链接
+        if link and isinstance(link, str):
+            if not link.startswith("http"):
+                link = f"https://jwc.qfnu.edu.cn/{link}"
+
+        # 生成唯一标识
+        notice_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
+
+        notices.append(
+            {
+                "id": notice_id,
+                "title": title,
+                "link": link,
+                "summary": summary,
+                "type": notice_type,
+            }
+        )
+
+    return notices
+
+
+async def check_and_send_notices(websocket):
+    """检查并发送新通知"""
+    global last_execution_time
+
+    # 检查是否是5的倍数分钟
+    if not is_five_minutes():
+        logging.info("当前时间不是5的倍数，跳过监控教务处公告")
+        return
+
+    # 检查是否已经在本分钟内执行过
+    current_time = datetime.now()
+    if last_execution_time and last_execution_time.minute == current_time.minute:
+        logging.info("当前分钟已执行过，跳过监控教务处公告")
+        return
+
+    last_execution_time = current_time
+
+    try:
+        history = load_history()
+
+        for notice_type, url in MONITOR_URLS.items():
+            html = await fetch_page(url)
+            current_notices = parse_notices(html, notice_type)
+
+            # 获取历史记录中的通知ID列表
+            history_ids = [notice["id"] for notice in history[notice_type]]
+
+            # 检查新通知
+            new_notices = [
+                notice for notice in current_notices if notice["id"] not in history_ids
+            ]
+
+            if new_notices:
+                # 更新历史记录
+                history[notice_type] = current_notices[:10]  # 只保留最新的10条
+                save_history(history)
+
+                # 发送新通知到所有开启功能的群
+                for notice in new_notices:
+                    message = (
+                        f"🔔 新{notice_type}：\n"
+                        f"📌 标题：{notice['title']}\n"
+                        f"🔗 链接：{notice['link']}\n"
+                        f"📝 摘要：{notice['summary']}"
+                    )
+
+                    # 获取所有群组并发送消息
+                    for group_id in get_all_groups():
+                        if load_function_status(group_id):
+                            await send_group_msg(websocket, group_id, message)
+
+    except Exception as e:
+        logging.error(f"检查新通知失败: {e}")
+
+
 # 统一事件处理入口
 async def handle_events(websocket, msg):
     """统一事件处理入口"""
@@ -179,7 +351,8 @@ async def handle_events(websocket, msg):
 
         # 处理元事件
         if post_type == "meta_event":
-            await handle_meta_event(websocket, msg)
+            # 检查新通知
+            await check_and_send_notices(websocket)
 
         # 处理消息事件
         elif post_type == "message":
